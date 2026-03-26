@@ -217,9 +217,16 @@ if analysis_logs:
 else:
     st.info("Processed clip logs will appear here.")
 
+if (
+    webcam_snapshot["is_running"]
+    and webcam_snapshot["submitted_clip_count"] > 0
+    and webcam_snapshot["processed_clip_count"] == 0
+):
+    st.caption("The first log can take a little time while the vision model warms up and processes the first saved clip.")
+
 if webcam_snapshot["error_message"]:
     st.error(webcam_snapshot["error_message"])
 
 if webcam_controller.snapshot()["is_running"]:
-    time.sleep(0.08)
+    time.sleep(0.4)
     rerun_app()

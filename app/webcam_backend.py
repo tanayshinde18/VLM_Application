@@ -140,11 +140,18 @@ class WebcamBackend:
 
     def snapshot(self) -> Dict:
         with self.lock:
+            latest_result = None
+            if self.latest_result is not None:
+                latest_result = {
+                    key: value
+                    for key, value in self.latest_result.items()
+                    if key not in {"frame_bgr", "frame_path"}
+                }
             return {
                 "is_running": self.is_running,
                 "is_inference_running": self.is_inference_running,
                 "latest_frame_bgr": None if self.latest_frame_bgr is None else self.latest_frame_bgr.copy(),
-                "latest_result": None if self.latest_result is None else dict(self.latest_result),
+                "latest_result": latest_result,
                 "result_counter": self.result_counter,
                 "buffer_size": self.buffer_size,
                 "fps": self.fps,
@@ -292,11 +299,12 @@ class WebcamBackend:
                 video_path=clip_path,
                 frame_interval=self.frame_interval,
                 include_frame=True,
-                max_samples=3,
+                max_samples=1,
             )
         except Exception as error:
             with self.lock:
                 self.error_message = f"Webcam inference error: {error}"
+                self.is_inference_running = False
             return
 
         result = dict(result)
@@ -321,6 +329,7 @@ class WebcamBackend:
 
         log_entry = {
             "timestamp": result["timestamp"],
+            "prompt": result.get("prompt", ""),
             "caption": result.get("caption", ""),
             "risk_level": result.get("risk_level", "SAFE"),
             "sentiment": result.get("sentiment_label", "unknown"),

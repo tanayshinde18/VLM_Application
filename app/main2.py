@@ -8,7 +8,7 @@ from typing import Dict, Iterator, List, Optional
 
 import cv2
 
-from caption_generator import CaptionGenerator
+from blipBase import BLIPBaseCaptionGenerator
 from frame_extractor import FrameExtractor
 from incident_detector import IncidentDetector
 from sentiment_analyzer import SentimentAnalyzer
@@ -18,6 +18,7 @@ from sentiment_analyzer import SentimentAnalyzer
 class FrameAnalysis:
     timestamp: str
     frame_path: str
+    prompt: str
     caption: str
     risk_level: str
     risk_score: int
@@ -32,7 +33,7 @@ class FrameAnalysis:
 class SurveillancePipeline:
     """
     Callable backend pipeline for video surveillance analysis.
-    Reuses existing FrameExtractor, CaptionGenerator, and IncidentDetector.
+    Reuses existing FrameExtractor, BLIPBaseCaptionGenerator, and IncidentDetector.
     """
 
     def __init__(
@@ -41,15 +42,17 @@ class SurveillancePipeline:
         context: str = "",
     ) -> None:
         self.context = context
-        self.caption_generator = CaptionGenerator(model_name=model_name)
+        self.caption_generator = BLIPBaseCaptionGenerator(model_name=model_name)
         self.incident_detector = IncidentDetector()
         self.sentiment_analyzer = SentimentAnalyzer()
 
     def analyze_frame(self, frame_path: str, include_frame: bool = False) -> Dict:
-        caption = self.caption_generator.generate_caption(
+        caption_result = self.caption_generator.generate_caption(
             frame_path,
             context=self.context,
         )
+        prompt = caption_result.get("prompt", "")
+        caption = caption_result.get("caption", "")
         incident = self.incident_detector.detect(caption)
 
         frame_bgr = None
@@ -59,6 +62,7 @@ class SurveillancePipeline:
         result = FrameAnalysis(
             timestamp=datetime.now().strftime("%H:%M:%S"),
             frame_path=frame_path,
+            prompt=prompt,
             caption=caption,
             risk_level=incident["risk_level"],
             risk_score=incident["risk_score"],
@@ -78,6 +82,9 @@ class SurveillancePipeline:
                 raise RuntimeError("Unable to write temporary frame for analysis.")
 
             result = self.analyze_frame(temp_path, include_frame=False)
+            # The temp JPG is deleted in the finally block below, so do not
+            # keep its path in results that may be surfaced to Streamlit.
+            result["frame_path"] = ""
             if include_frame:
                 result["frame_bgr"] = frame_bgr.copy()
             return result
