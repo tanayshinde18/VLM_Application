@@ -24,7 +24,9 @@ def build_incident_pdf_report(
 
 
 def _build_report_lines(logs: Sequence[Dict[str, str]], title: str, generated_at: str) -> List[LineItem]:
-    risk_counts = Counter(log.get("Risk Level", "UNKNOWN") for log in logs)
+    risk_counts = Counter(
+        log.get("Risk Level", log.get("risk_level", "UNKNOWN")) for log in logs
+    )
 
     lines: List[LineItem] = [
         ("F2", 18, title),
@@ -41,11 +43,22 @@ def _build_report_lines(logs: Sequence[Dict[str, str]], title: str, generated_at
     ]
 
     for idx, log in enumerate(logs, start=1):
-        timestamp = str(log.get("Timestamp", "N/A"))
-        risk = str(log.get("Risk Level", "UNKNOWN"))
-        caption = str(log.get("Caption Snippet", ""))
+        timestamp = str(log.get("Timestamp", log.get("timestamp", "N/A")))
+        risk = str(log.get("Risk Level", log.get("risk_level", "UNKNOWN")))
+        caption = str(log.get("Caption Snippet", log.get("caption", "")))
+        sentiment = str(log.get("sentiment", "")).upper()
+        unsafe = str(log.get("unsafe", ""))
+        reason = str(log.get("reason", ""))
 
-        caption_parts = wrap(caption, width=58) or [""]
+        caption_text = caption
+        if sentiment:
+            caption_text += f" | Sentiment: {sentiment}"
+        if unsafe:
+            caption_text += f" | Unsafe: {unsafe}"
+        if reason:
+            caption_text += f" | {reason}"
+
+        caption_parts = wrap(caption_text, width=58) or [""]
         first_line_prefix = f"{timestamp:<10} {risk:<12} "
         lines.append(("F1", 10, f"{idx:>3}. {first_line_prefix}{caption_parts[0]}"))
         for continuation in caption_parts[1:]:

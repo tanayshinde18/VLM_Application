@@ -1,5 +1,6 @@
-import os
+import inspect
 import tempfile
+import time
 from datetime import datetime
 
 import cv2
@@ -9,234 +10,202 @@ import streamlit as st
 from audio_alert import AlertPlayer
 from main2 import SurveillancePipeline
 from report_exporter import build_incident_pdf_report
+from webcam_backend import WebcamBackend
 
 
-def add_risk_border(image, risk_level, thickness=10):
-    """
-    Adds a colored border to the image based on risk level.
-    """
-    if risk_level == "SAFE":
-        color = (0, 255, 0)       # Green
-    elif risk_level == "SUSPICIOUS":
-        color = (0, 255, 255)     # Yellow
+def _supports_kwarg(func, kwarg_name):
+    try:
+        return kwarg_name in inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _call_streamlit(func, *args, **kwargs):
+    supported_kwargs = {
+        key: value for key, value in kwargs.items() if _supports_kwarg(func, key)
+    }
+    return func(*args, **supported_kwargs)
+
+
+if hasattr(st, "cache_resource"):
+    cache_resource = st.cache_resource
+else:
+    def cache_resource(func):
+        return st.cache(allow_output_mutation=True)(func)
+
+
+def rerun_app():
+    if hasattr(st, "rerun"):
+        st.rerun()
     else:
-        color = (0, 0, 255)       # Red
-
-    bordered_image = cv2.copyMakeBorder(
-        image,
-        thickness, thickness, thickness, thickness,
-        cv2.BORDER_CONSTANT,
-        value=color
-    )
-    return bordered_image
+        st.experimental_rerun()
 
 
-@st.cache_resource
+@cache_resource
 def get_pipeline():
     return SurveillancePipeline()
 
 
-def estimate_total_samples(video_path, frame_interval):
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return None
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.release()
-    if frame_count <= 0:
-        return None
-    return max(1, (frame_count + frame_interval - 1) // frame_interval)
+@cache_resource
+def get_webcam_controller():
+    return WebcamBackend()
 
 
-def render_live_frame(frame_slot, frame, risk_level):
+def create_alert_player(audio_enabled, audio_mode_label, uploaded_alert_audio, trigger_level):
+    temp_alert_audio_path = None
+    audio_mode = "beep"
+
+    if audio_mode_label == "Custom WAV" and uploaded_alert_audio is not None:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as audio_file:
+            audio_file.write(uploaded_alert_audio.getbuffer())
+            temp_alert_audio_path = audio_file.name
+        audio_mode = "custom_wav"
+
+    alert_player = AlertPlayer(
+        enabled=audio_enabled,
+        mode=audio_mode,
+        wav_path=temp_alert_audio_path,
+        trigger_level=trigger_level,
+    )
+    return alert_player, temp_alert_audio_path
+
+
+def render_live_frame(frame_slot, frame):
     if frame is None:
-        frame_slot.info("No frame available. Start surveillance to begin.")
+        frame_slot.info("No frame available. Start the webcam to begin live monitoring.")
         return
 
     if not isinstance(frame, np.ndarray):
         frame = np.array(frame)
 
-    bordered_frame = add_risk_border(frame, risk_level)
-    bordered_frame = cv2.cvtColor(bordered_frame, cv2.COLOR_BGR2RGB)
-    frame_slot.image(bordered_frame, width="stretch")
-
-
-def render_analysis_panel(caption_slot, risk_slot, explanation_slot, caption, risk, explanation):
-    caption_slot.markdown(caption if caption else "_Caption will appear here_")
-
-    if risk == "SAFE":
-        risk_slot.markdown("### 🟢 SAFE")
-    elif risk == "SUSPICIOUS":
-        risk_slot.markdown("### 🟡 SUSPICIOUS")
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    if _supports_kwarg(frame_slot.image, "use_container_width"):
+        frame_slot.image(rgb_frame, use_container_width=True)
+    elif _supports_kwarg(frame_slot.image, "use_column_width"):
+        frame_slot.image(rgb_frame, use_column_width=True)
     else:
-        risk_slot.markdown("### 🔴 DANGEROUS")
-
-    explanation_slot.markdown(explanation if explanation else "_Explanation will appear here_")
+        frame_slot.image(rgb_frame)
 
 
-# -------------------------------------------------
-# Page Configuration
-# -------------------------------------------------
-st.set_page_config(
-    page_title="Real-Time CCTV Surveillance",
-    layout="wide"
-)
+st.set_page_config(page_title="Live CCTV Monitoring", layout="wide")
 
-# -------------------------------------------------
-# Session State Initialization
-# -------------------------------------------------
-if "running" not in st.session_state:
-    st.session_state.running = False
+st.title("Live CCTV Monitoring")
+st.caption("Low-latency live view with background clip analysis, sentiment logging, unsafe clip retention, and optional SMS alerts.")
 
-if "logs" not in st.session_state:
-    st.session_state.logs = []
+webcam_controller = get_webcam_controller()
+webcam_snapshot = webcam_controller.snapshot()
 
-if "current_caption" not in st.session_state:
-    st.session_state.current_caption = ""
-
-if "current_risk" not in st.session_state:
-    st.session_state.current_risk = "SAFE"
-
-if "current_explanation" not in st.session_state:
-    st.session_state.current_explanation = ""
-
-if "current_frame" not in st.session_state:
-    st.session_state.current_frame = None
-
-if "is_processing" not in st.session_state:
-    st.session_state.is_processing = False
-
-
-# -------------------------------------------------
-# Header
-# -------------------------------------------------
-st.title("Real-Time CCTV Surveillance using Vision-Language Models")
-st.caption("Automated Detection of Accidents and Suspicious Activities")
-
-st.markdown("---")
-
-# -------------------------------------------------
-# Sidebar – Controls
-# -------------------------------------------------
 st.sidebar.header("Controls")
 
-# ---- Video Source ----
-st.sidebar.subheader("Input Video / Camera")
+clip_duration_seconds = st.sidebar.slider("Clip Duration (seconds)", 2, 3, 3)
+target_webcam_fps = st.sidebar.slider("Target Webcam FPS", 5, 25, 15)
+frame_interval = st.sidebar.slider("Analysis Frame Interval", 1, 30, 10)
+st.sidebar.caption("Live video stays direct. Only saved clips are analyzed in the background.")
 
-video_source = st.sidebar.selectbox(
-    label="Video Input Source",
-    options=["Upload Video (MP4)", "Webcam (Coming Soon)"],
-    label_visibility="collapsed"
-)
+st.sidebar.subheader("SMS Alerts")
+enable_sms = st.sidebar.checkbox("Send SMS for unsafe clips", value=True)
+st.sidebar.caption("Configure `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, and `TWILIO_TO_NUMBER` in your environment.")
 
-uploaded_video = None
-if video_source == "Upload Video (MP4)":
-    uploaded_video = st.sidebar.file_uploader(
-        label="Upload MP4 Video",
-        type=["mp4"],
-        label_visibility="collapsed"
-    )
-else:
-    st.sidebar.info("Webcam support will be added in future.")
-
-# ---- Surveillance Control ----
-st.sidebar.subheader("Surveillance Control")
-
-col_start, col_pause = st.sidebar.columns(2)
-
-with col_start:
-    if st.button("Start Surveillance"):
-        st.session_state.running = True
-
-with col_pause:
-    if st.button("Pause Surveillance"):
-        st.session_state.running = False
-
-# ---- Analysis Frequency ----
-st.sidebar.subheader("Analysis Frequency")
-
-frame_interval = st.sidebar.slider(
-    label="Frame Interval",
-    min_value=1,
-    max_value=30,
-    value=10,
-    label_visibility="collapsed"
-)
-
-st.sidebar.caption("Lower value = higher accuracy, slower performance")
-
-# ---- Audio Alerts ----
 st.sidebar.subheader("Audio Alerts")
 audio_enabled = st.sidebar.checkbox("Enable audio alerts", value=True)
 audio_trigger_level = st.sidebar.selectbox(
     "Play alerts for",
-    options=["Dangerous + Suspicious", "Dangerous only"]
+    options=["Dangerous + Suspicious", "Dangerous only"],
 )
 audio_mode_label = st.sidebar.selectbox(
     "Alert sound mode",
-    options=["Beep", "Custom WAV"]
+    options=["Beep", "Custom WAV"],
 )
 uploaded_alert_audio = None
 if audio_mode_label == "Custom WAV":
-    uploaded_alert_audio = st.sidebar.file_uploader(
-        "Upload WAV alert sound",
-        type=["wav"]
+    uploaded_alert_audio = st.sidebar.file_uploader("Upload WAV alert sound", type=["wav"])
+
+start_col, stop_col = st.sidebar.columns(2)
+with start_col:
+    start_webcam_clicked = st.button("Start Webcam")
+with stop_col:
+    stop_webcam_clicked = st.button("Stop Webcam")
+
+if st.sidebar.button("Clear Backend Logs"):
+    webcam_controller.clear_logs()
+    webcam_snapshot = webcam_controller.snapshot()
+
+if start_webcam_clicked and not webcam_snapshot["is_running"]:
+    pipeline = get_pipeline()
+    alert_player, temp_alert_audio_path = create_alert_player(
+        audio_enabled=audio_enabled,
+        audio_mode_label=audio_mode_label,
+        uploaded_alert_audio=uploaded_alert_audio,
+        trigger_level=audio_trigger_level,
     )
+    webcam_controller.start(
+        pipeline=pipeline,
+        frame_interval=frame_interval,
+        clip_duration=clip_duration_seconds,
+        target_fps=target_webcam_fps,
+        alert_player=alert_player,
+        temp_audio_path=temp_alert_audio_path,
+        enable_sms=enable_sms,
+    )
+    webcam_snapshot = webcam_controller.snapshot()
 
-# ---- Clear Logs ----
-if st.sidebar.button("Clear Logs"):
-    st.session_state.logs.clear()
+if stop_webcam_clicked and webcam_snapshot["is_running"]:
+    webcam_controller.stop()
+    webcam_snapshot = webcam_controller.snapshot()
 
-# -------------------------------------------------
-# Main Layout
-# -------------------------------------------------
-left_col, right_col = st.columns([2, 1])
+left_col, right_col = st.columns([2.4, 1.2])
 
-# -------------------------------------------------
-# Live Frame View
-# -------------------------------------------------
 with left_col:
-    st.subheader("Live Frame View")
+    st.subheader("Live Feed")
     live_frame_slot = st.empty()
-    render_live_frame(
-        live_frame_slot,
-        st.session_state.current_frame,
-        st.session_state.current_risk
-    )
+    render_live_frame(live_frame_slot, webcam_snapshot["latest_frame_bgr"])
 
-# -------------------------------------------------
-# Analysis Panel
-# -------------------------------------------------
+    status_items = [
+        f"Status: {'Running' if webcam_snapshot['is_running'] else 'Stopped'}",
+        f"FPS: {webcam_snapshot['fps']:.1f}",
+        f"Frames in current clip: {webcam_snapshot['buffer_size']}",
+        f"Queued clips: {webcam_snapshot['pending_queue_size']}",
+        f"Processed clips: {webcam_snapshot['processed_clip_count']}",
+    ]
+    if webcam_snapshot["active_device_index"] is not None:
+        status_items.append(f"Camera: {webcam_snapshot['active_device_index']}")
+    st.caption(" | ".join(status_items))
+
 with right_col:
-    st.subheader("Generated Caption")
-    caption_slot = st.empty()
+    st.subheader("Backend Status")
+    latest_result = webcam_snapshot["latest_result"]
+    if latest_result:
+        st.write(f"Last processed at: `{webcam_snapshot['last_result_at']}`")
+        st.write(f"Latest risk: `{latest_result.get('risk_level', 'SAFE')}`")
+        st.write(f"Latest sentiment: `{latest_result.get('sentiment_label', 'unknown')}`")
+        st.write(f"Unsafe decision: `{'YES' if latest_result.get('unsafe') else 'NO'}`")
+        st.write(f"SMS sent: `{'YES' if latest_result.get('sms_sent') else 'NO'}`")
+    else:
+        st.write("No clips processed yet.")
 
-    st.subheader("Threat Assessment")
-    risk_slot = st.empty()
+    st.markdown("**Counters**")
+    st.write(f"Submitted clips: `{webcam_snapshot['submitted_clip_count']}`")
+    st.write(f"Safe clips deleted: `{webcam_snapshot['safe_clip_count']}`")
+    st.write(f"Unsafe clips stored: `{webcam_snapshot['unsafe_clip_count']}`")
+    st.write(f"SMS sent count: `{webcam_snapshot['sms_sent_count']}`")
 
-    st.subheader("Analysis Details")
-    explanation_slot = st.empty()
+    clip_directories = webcam_snapshot["clip_directories"]
+    st.markdown("**Clip Storage**")
+    st.write(f"Pending folder: `{clip_directories['pending']}`")
+    st.write(f"Unsafe folder: `{clip_directories['unsafe']}`")
+    st.write(f"Safe temp folder: `{clip_directories['safe']}`")
 
-    render_analysis_panel(
-        caption_slot,
-        risk_slot,
-        explanation_slot,
-        st.session_state.current_caption,
-        st.session_state.current_risk,
-        st.session_state.current_explanation
-    )
-
-# -------------------------------------------------
-# Detection Log
-# -------------------------------------------------
 st.markdown("---")
-st.subheader("Detection Log")
+st.subheader("Analysis Logs")
 
-if st.session_state.logs:
-    st.table(st.session_state.logs)
+analysis_logs = webcam_snapshot["analysis_logs"]
+if analysis_logs:
+    st.table(analysis_logs)
     try:
-        pdf_bytes = build_incident_pdf_report(st.session_state.logs)
+        pdf_bytes = build_incident_pdf_report(analysis_logs)
         report_filename = f"incident_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-        st.download_button(
+        _call_streamlit(
+            st.download_button,
             label="Download PDF Report",
             data=pdf_bytes,
             file_name=report_filename,
@@ -246,117 +215,11 @@ if st.session_state.logs:
     except Exception as error:
         st.error(f"Unable to generate PDF report: {error}")
 else:
-    st.info("No incidents logged yet.")
+    st.info("Processed clip logs will appear here.")
 
-# -------------------------------------------------
-# Backend Integration
-# -------------------------------------------------
-if st.session_state.running and uploaded_video is not None and not st.session_state.is_processing:
-    st.session_state.is_processing = True
-    temp_video_path = None
-    temp_alert_audio_path = None
+if webcam_snapshot["error_message"]:
+    st.error(webcam_snapshot["error_message"])
 
-    try:
-        pipeline = get_pipeline()
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_file:
-            temp_file.write(uploaded_video.getbuffer())
-            temp_video_path = temp_file.name
-
-        audio_mode = "beep"
-        if audio_mode_label == "Custom WAV" and uploaded_alert_audio is not None:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as audio_file:
-                audio_file.write(uploaded_alert_audio.getbuffer())
-                temp_alert_audio_path = audio_file.name
-            audio_mode = "custom_wav"
-
-        alert_player = AlertPlayer(
-            enabled=audio_enabled,
-            mode=audio_mode,
-            wav_path=temp_alert_audio_path,
-            trigger_level=audio_trigger_level,
-        )
-
-        total_samples = estimate_total_samples(temp_video_path, frame_interval)
-        processed_count = 0
-
-        st.markdown("---")
-        st.subheader("Processing Status")
-        progress_text = st.empty()
-        progress_bar = st.progress(0)
-
-        with st.spinner("Running surveillance analysis..."):
-            for result in pipeline.iter_video_analysis(
-                video_path=temp_video_path,
-                output_dir="frames_interval",
-                frame_interval=frame_interval,
-                cleanup=True,
-                include_frame=True,
-            ):
-                processed_count += 1
-                st.session_state.current_frame = result["frame_bgr"]
-                st.session_state.current_caption = result["caption"]
-                st.session_state.current_risk = result["risk_level"]
-                st.session_state.current_explanation = result["explanation"]
-
-                render_live_frame(
-                    live_frame_slot,
-                    st.session_state.current_frame,
-                    st.session_state.current_risk
-                )
-                render_analysis_panel(
-                    caption_slot,
-                    risk_slot,
-                    explanation_slot,
-                    st.session_state.current_caption,
-                    st.session_state.current_risk,
-                    st.session_state.current_explanation
-                )
-
-                try:
-                    alert_player.play(result["risk_level"])
-                except RuntimeError:
-                    pass
-
-                if total_samples:
-                    percent = min(1.0, processed_count / total_samples)
-                    progress_text.markdown(
-                        f"Processing frame sample **{processed_count}/{total_samples}**"
-                    )
-                    progress_bar.progress(percent)
-                else:
-                    progress_text.markdown(
-                        f"Processing frame sample **{processed_count}**"
-                    )
-
-                caption_snippet = result["caption"][:60]
-                if len(result["caption"]) > 60:
-                    caption_snippet += "..."
-
-                st.session_state.logs.append(
-                    {
-                        "Timestamp": result["timestamp"] or datetime.now().strftime("%H:%M:%S"),
-                        "Risk Level": result["risk_level"],
-                        "Caption Snippet": caption_snippet,
-                    }
-                )
-
-        progress_bar.progress(1.0)
-        progress_text.markdown(f"Processed **{processed_count}** frame samples.")
-        st.session_state.running = False
-        st.success("Surveillance analysis completed.")
-        st.rerun()
-
-    except Exception as error:
-        st.session_state.running = False
-        st.error(f"Backend error: {error}")
-
-    finally:
-        st.session_state.is_processing = False
-        if temp_video_path and os.path.exists(temp_video_path):
-            os.remove(temp_video_path)
-        if temp_alert_audio_path and os.path.exists(temp_alert_audio_path):
-            os.remove(temp_alert_audio_path)
-
-elif st.session_state.running and uploaded_video is None:
-    st.warning("Please upload an MP4 file before starting surveillance.")
+if webcam_controller.snapshot()["is_running"]:
+    time.sleep(0.08)
+    rerun_app()

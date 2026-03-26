@@ -1,7 +1,7 @@
 streamlit
-opencv-python
-numpy
-torch
-transformers
+opencv-python<4.13
+numpy<2
+torch==2.5.1
+transformers<5
 Pillow
 rich
