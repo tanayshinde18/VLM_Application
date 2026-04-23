@@ -8,10 +8,10 @@ from typing import Dict, Iterator, List, Optional
 
 import cv2
 
-from blipBase import BLIPBaseCaptionGenerator
 from frame_extractor import FrameExtractor
 from incident_detector import IncidentDetector
 from sentiment_analyzer import SentimentAnalyzer
+from blipBase import BLIPBaseCaptionGenerator
 
 
 @dataclass
@@ -33,7 +33,7 @@ class FrameAnalysis:
 class SurveillancePipeline:
     """
     Callable backend pipeline for video surveillance analysis.
-    Reuses existing FrameExtractor, BLIPBaseCaptionGenerator, and IncidentDetector.
+    Reuses existing FrameExtractor, caption generator, and IncidentDetector.
     """
 
     def __init__(
@@ -51,8 +51,8 @@ class SurveillancePipeline:
             frame_path,
             context=self.context,
         )
-        prompt = caption_result.get("prompt", "")
-        caption = caption_result.get("caption", "")
+        caption = caption_result["caption"]
+        prompt = caption_result["prompt"]
         incident = self.incident_detector.detect(caption)
 
         frame_bgr = None
@@ -73,6 +73,9 @@ class SurveillancePipeline:
         return result.to_dict()
 
     def analyze_frame_array(self, frame_bgr, include_frame: bool = False) -> Dict:
+        if frame_bgr is None or getattr(frame_bgr, "size", 0) == 0:
+            raise RuntimeError("Received an empty frame for analysis.")
+
         temp_path = None
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
@@ -143,6 +146,8 @@ class SurveillancePipeline:
                 success, frame = capture.read()
                 if not success:
                     break
+                if frame is None or getattr(frame, "size", 0) == 0:
+                    continue
                 frames_bgr.append(frame)
         finally:
             capture.release()

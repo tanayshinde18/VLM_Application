@@ -4,18 +4,53 @@ import os
 import shutil
 import threading
 import time
+import traceback
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
 import cv2
 
 from sms_notifier import SMSNotifier
 
 
-def open_webcam(max_devices: int = 3) -> Tuple[Optional[cv2.VideoCapture], Optional[int]]:
+def _candidate_video_sources(source: Union[int, str]) -> List[Union[int, str]]:
+    if not isinstance(source, str):
+        return [source]
+
+    normalized = source.strip()
+    if not normalized:
+        return [normalized]
+
+    parsed = urlparse(normalized)
+    if parsed.scheme and parsed.netloc and parsed.path not in ("", "/"):
+        return [normalized]
+
+    if parsed.scheme and parsed.netloc and parsed.path in ("", "/"):
+        return [
+            normalized.rstrip("/"),
+            normalized.rstrip("/") + "/video",
+        ]
+
+    return [normalized]
+
+
+def open_webcam(
+    source: Optional[Union[int, str]] = None,
+    max_devices: int = 3,
+) -> Tuple[Optional[cv2.VideoCapture], Optional[Union[int, str]]]:
     backend = cv2.CAP_DSHOW if hasattr(cv2, "CAP_DSHOW") else None
+
+    if source not in (None, ""):
+        for candidate in _candidate_video_sources(source):
+            for api_preference in (cv2.CAP_FFMPEG, cv2.CAP_ANY):
+                capture = cv2.VideoCapture(candidate, api_preference)
+                if capture.isOpened():
+                    return capture, candidate
+                capture.release()
+        return None, None
 
     for device_index in range(max_devices):
         capture = cv2.VideoCapture(device_index, backend) if backend is not None else cv2.VideoCapture(device_index)
@@ -52,7 +87,8 @@ class WebcamBackend:
         self.latest_frame_bgr = None
         self.current_clip_started_at = ""
         self.last_result_at = ""
-        self.active_device_index: Optional[int] = None
+        self.active_device_index: Optional[Union[int, str]] = None
+        self.video_source: Optional[Union[int, str]] = None
         self.buffer_size = 0
         self.fps = 0.0
         self.error_message = ""
@@ -74,6 +110,7 @@ class WebcamBackend:
         alert_player,
         temp_audio_path: Optional[str] = None,
         enable_sms: bool = True,
+        video_source: Optional[Union[int, str]] = None,
     ) -> None:
         if self.is_running:
             return
@@ -85,6 +122,7 @@ class WebcamBackend:
         self.target_fps = target_fps
         self.temp_audio_path = temp_audio_path
         self.sms_notifier = SMSNotifier(enabled=enable_sms)
+        self.video_source = video_source
         self.stop_event = threading.Event()
         self.inference_event = threading.Event()
 
@@ -180,10 +218,13 @@ class WebcamBackend:
             self.latest_result = None
 
     def _run_capture_loop(self) -> None:
-        capture, device_index = open_webcam()
+        capture, device_index = open_webcam(source=self.video_source)
         if capture is None:
             with self.lock:
-                self.error_message = "No webcam found. Please connect a camera and try again."
+                if self.video_source not in (None, ""):
+                    self.error_message = f"Unable to open video source: {self.video_source}"
+                else:
+                    self.error_message = "No webcam found. Please connect a camera and try again."
                 self.is_running = False
             self._cleanup_temp_audio()
             return
@@ -218,6 +259,8 @@ class WebcamBackend:
                 with self.lock:
                     self.error_message = "Unable to read frames from the webcam."
                 break
+            if frame is None or not hasattr(frame, "shape") or getattr(frame, "size", 0) == 0:
+                continue
 
             now = time.time()
             if last_frame_time is None:
@@ -302,8 +345,13 @@ class WebcamBackend:
                 max_samples=1,
             )
         except Exception as error:
+            if os.path.exists(clip_path):
+                os.remove(clip_path)
+            trace_summary = traceback.format_exc(limit=2).strip()
             with self.lock:
-                self.error_message = f"Webcam inference error: {error}"
+                self.error_message = (
+                    f"Webcam inference error ({type(error).__name__}): {error}\n{trace_summary}"
+                )
                 self.is_inference_running = False
             return
 

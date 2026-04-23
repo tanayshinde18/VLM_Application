@@ -72,7 +72,15 @@ def create_alert_player(audio_enabled, audio_mode_label, uploaded_alert_audio, t
 
 def render_live_frame(frame_slot, frame):
     if frame is None:
-        frame_slot.info("No frame available. Start the webcam to begin live monitoring.")
+        cached_frame = st.session_state.get("last_live_frame_bgr")
+        if cached_frame is None:
+            frame_slot.info("No frame available. Start the webcam to begin live monitoring.")
+            return
+        frame = cached_frame
+    else:
+        st.session_state["last_live_frame_bgr"] = frame.copy()
+
+    if frame is None:
         return
 
     if not isinstance(frame, np.ndarray):
@@ -97,6 +105,15 @@ webcam_snapshot = webcam_controller.snapshot()
 
 st.sidebar.header("Controls")
 
+video_source_mode = st.sidebar.selectbox(
+    "Video Source",
+    options=["Laptop Webcam", "Mobile Camera URL"],
+)
+mobile_camera_url = st.sidebar.text_input(
+    "Mobile Camera URL",
+    value="http://192.168.1.30:8080",
+    disabled=video_source_mode != "Mobile Camera URL",
+)
 clip_duration_seconds = st.sidebar.slider("Clip Duration (seconds)", 2, 3, 3)
 target_webcam_fps = st.sidebar.slider("Target Webcam FPS", 5, 25, 15)
 frame_interval = st.sidebar.slider("Analysis Frame Interval", 1, 30, 10)
@@ -132,6 +149,7 @@ if st.sidebar.button("Clear Backend Logs"):
 
 if start_webcam_clicked and not webcam_snapshot["is_running"]:
     pipeline = get_pipeline()
+    video_source = mobile_camera_url.strip() if video_source_mode == "Mobile Camera URL" else None
     alert_player, temp_alert_audio_path = create_alert_player(
         audio_enabled=audio_enabled,
         audio_mode_label=audio_mode_label,
@@ -146,6 +164,7 @@ if start_webcam_clicked and not webcam_snapshot["is_running"]:
         alert_player=alert_player,
         temp_audio_path=temp_alert_audio_path,
         enable_sms=enable_sms,
+        video_source=video_source,
     )
     webcam_snapshot = webcam_controller.snapshot()
 
